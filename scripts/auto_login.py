@@ -4,6 +4,7 @@ ClawCloud 自动登录脚本
 - 等待设备验证批准（30秒）
 - 每次登录后自动更新 Cookie
 - Telegram 通知
+- 支持验证码验证
 """
 
 import base64
@@ -20,7 +21,7 @@ from playwright.sync_api import sync_playwright
 # 固定登录入口，OAuth后会自动跳转到实际区域
 LOGIN_ENTRY_URL = "https://console.run.claw.cloud"
 SIGNIN_URL = f"{LOGIN_ENTRY_URL}/signin"
-DEVICE_VERIFY_WAIT = 30  # Mobile验证 默认等 30 秒
+DEVICE_VERIFY_WAIT = 60  # Mobile验证 默认等 60 秒
 TWO_FACTOR_WAIT = int(os.environ.get("TWO_FACTOR_WAIT", "120"))  # 2FA验证 默认等 120 秒
 
 
@@ -300,32 +301,94 @@ class AutoLogin:
 
 请在 {DEVICE_VERIFY_WAIT} 秒内批准：
 1️⃣ 检查邮箱点击链接
-2️⃣ 或在 GitHub App 批准""")
+2️⃣ 或在 GitHub App 批准
+
+或者发送 /code 验证码进行验证""")
         
         if self.shots:
             self.tg.photo(self.shots[-1], "设备验证页面")
         
+        # 设置一个用于接收验证码的标记
+        code_received = False
+        code = None
+        
+        # 先刷新 Telegram 更新，避免读取旧消息
+        self.tg.flush_updates()
+        
         for i in range(DEVICE_VERIFY_WAIT):
+            # 尝试从 Telegram 获取验证码（非阻塞方式）
+            try:
+                code = self.tg.wait_code(timeout=1)  # 超时设为1秒，避免阻塞
+                if code:
+                    code_received = True
+                    self.log("收到验证码输入，切换到验证码验证模式", "INFO")
+                    break
+            except:
+                pass
+            
             time.sleep(1)
+            
+            # 检查是否已通过设备验证
+            url = page.url
+            if 'verified-device' not in url and 'device-verification' not in url:
+                self.log("设备验证通过！", "SUCCESS")
+                self.tg.send("✅ <b>设备验证通过</b>")
+                return True
+            
+            # 每5秒打印一次等待状态
             if i % 5 == 0:
-                self.log(f"  等待... ({i}/{DEVICE_VERIFY_WAIT}秒)")
-                url = page.url
-                if 'verified-device' not in url and 'device-verification' not in url:
-                    self.log("设备验证通过！", "SUCCESS")
-                    self.tg.send("✅ <b>设备验证通过</b>")
-                    return True
+                self.log(f"  等待设备验证... ({i}/{DEVICE_VERIFY_WAIT}秒)")
                 try:
                     page.reload(timeout=10000)
                     page.wait_for_load_state('networkidle', timeout=10000)
                 except:
                     pass
         
-        if 'verified-device' not in page.url:
+        # 如果收到验证码，尝试进行验证码验证
+        if code_received and code:
+            self.log("尝试使用验证码验证...", "STEP")
+            self.tg.send("🔐 <b>使用验证码验证设备</b>")
+            return self.handle_2fa_code_input(page, code_prefilled=code)
+        
+        # 检查是否最终通过了设备验证
+        if 'verified-device' not in page.url and 'device-verification' not in page.url:
             return True
         
-        self.log("设备验证超时", "ERROR")
-        self.tg.send("❌ <b>设备验证超时</b>")
-        return False
+        # 设备验证超时，尝试切换到验证码验证
+        self.log("设备验证超时，尝试切换到验证码验证", "WARN")
+        self.tg.send("""
+❌ <b>设备验证超时</b>
+
+尝试切换到验证码验证，请在 Telegram 里发送：
+<code>/code 你的6位验证码</code>""")
+        
+        # 尝试点击切换到验证码选项（如果存在）
+        try:
+            # 尝试查找切换到验证码的链接
+            switch_selectors = [
+                'a:has-text("Use an authentication app")',
+                'a:has-text("Enter a code")',
+                'button:has-text("Use an authentication app")',
+                'a[href*="two-factor/app"]'
+            ]
+            
+            for selector in switch_selectors:
+                try:
+                    element = page.locator(selector).first
+                    if element.is_visible(timeout=2000):
+                        element.click()
+                        self.log("已切换到验证码输入", "SUCCESS")
+                        time.sleep(2)
+                        page.wait_for_load_state('networkidle', timeout=15000)
+                        self.shot(page, "切换到验证码输入")
+                        break
+                except:
+                    pass
+        except Exception as e:
+            self.log(f"切换验证方式失败: {e}", "WARN")
+        
+        # 调用验证码处理方法
+        return self.handle_2fa_code_input(page)
     
     def wait_two_factor_mobile(self, page):
         """等待 GitHub Mobile 两步验证批准，并把数字截图提前发到电报"""
@@ -376,7 +439,7 @@ class AutoLogin:
         self.tg.send("❌ <b>两步验证超时</b>")
         return False
     
-    def handle_2fa_code_input(self, page):
+    def handle_2fa_code_input(self, page, code_prefilled=None):
         """处理 TOTP 验证码输入（通过 Telegram 发送 /code 123456）"""
         self.log("需要输入验证码", "WARN")
         shot = self.shot(page, "两步验证_code")
@@ -428,27 +491,32 @@ class AutoLogin:
         except:
             pass
 
-        # 发送提示并等待验证码
-        self.tg.send(f"""🔐 <b>需要验证码登录</b>
+        # 如果已经有预填写的验证码，直接使用
+        if code_prefilled:
+            code = code_prefilled
+            self.log(f"使用预填写的验证码", "INFO")
+        else:
+            # 发送提示并等待验证码
+            self.tg.send(f"""🔐 <b>需要验证码登录</b>
 
 用户{self.username}正在登录，请在 Telegram 里发送：
 <code>/code 你的6位验证码</code>
 
 等待时间：{TWO_FACTOR_WAIT} 秒""")
-        if shot:
-            self.tg.photo(shot, "两步验证页面")
+            if shot:
+                self.tg.photo(shot, "两步验证页面")
 
-        self.log(f"等待验证码（{TWO_FACTOR_WAIT}秒）...", "WARN")
-        code = self.tg.wait_code(timeout=TWO_FACTOR_WAIT)
+            self.log(f"等待验证码（{TWO_FACTOR_WAIT}秒）...", "WARN")
+            code = self.tg.wait_code(timeout=TWO_FACTOR_WAIT)
 
-        if not code:
-            self.log("等待验证码超时", "ERROR")
-            self.tg.send("❌ <b>等待验证码超时</b>")
-            return False
+            if not code:
+                self.log("等待验证码超时", "ERROR")
+                self.tg.send("❌ <b>等待验证码超时</b>")
+                return False
 
-        # 不打印验证码明文，只提示收到
-        self.log("收到验证码，正在填入...", "SUCCESS")
-        self.tg.send("✅ 收到验证码，正在填入...")
+            # 不打印验证码明文，只提示收到
+            self.log("收到验证码，正在填入...", "SUCCESS")
+            self.tg.send("✅ 收到验证码，正在填入...")
 
         # 常见 OTP 输入框 selector（优先级排序）
         selectors = [
