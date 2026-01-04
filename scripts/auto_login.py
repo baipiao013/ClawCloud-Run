@@ -21,7 +21,7 @@ from playwright.sync_api import sync_playwright
 # 固定登录入口，OAuth后会自动跳转到实际区域
 LOGIN_ENTRY_URL = "https://console.run.claw.cloud"
 SIGNIN_URL = f"{LOGIN_ENTRY_URL}/signin"
-DEVICE_VERIFY_WAIT = 60  # Mobile验证 默认等 60 秒
+DEVICE_VERIFY_WAIT = 30  # Mobile验证 默认等 60 秒
 TWO_FACTOR_WAIT = int(os.environ.get("TWO_FACTOR_WAIT", "120"))  # 2FA验证 默认等 120 秒
 
 
@@ -331,7 +331,7 @@ class AutoLogin:
 请在 {DEVICE_VERIFY_WAIT} 秒内通过以下任一方式验证：
 1️⃣ 检查邮箱点击链接
 2️⃣ 在 GitHub App 批准
-3️⃣ 在 Telegram 发送 <code>/code</code> 验证码
+3️⃣ 在 Telegram 发送 /code 验证码
 
 等待时间：{DEVICE_VERIFY_WAIT} 秒""")
         
@@ -695,7 +695,7 @@ class AutoLogin:
         self.tg.send(f"""🔐 <b>需要验证码登录</b>
 
 用户{self.username}正在登录，请在 Telegram 里发送：
-<code>/code</code> 你的6位验证码
+/code 你的6位验证码
 
 等待时间：{TWO_FACTOR_WAIT} 秒""")
         if shot:
