@@ -5,6 +5,7 @@ ClawCloud 自动登录脚本
 - 每次登录后自动更新 Cookie
 - Telegram 通知
 - 支持验证码验证
+- 验证页面图片在3秒后自动删除
 """
 
 import base64
@@ -12,6 +13,7 @@ import os
 import re
 import sys
 import time
+import threading
 from urllib.parse import urlparse
 
 import requests
@@ -23,6 +25,7 @@ LOGIN_ENTRY_URL = "https://console.run.claw.cloud"
 SIGNIN_URL = f"{LOGIN_ENTRY_URL}/signin"
 DEVICE_VERIFY_WAIT = 30  # Mobile验证 默认等 30 秒
 TWO_FACTOR_WAIT = int(os.environ.get("TWO_FACTOR_WAIT", "120"))  # 2FA验证 默认等 120 秒
+IMAGE_DELETE_DELAY = 3  # 验证页面图片在3秒后自动删除
 
 
 class Telegram:
@@ -59,6 +62,20 @@ class Telegram:
         except:
             pass
     
+    def delete_message(self, message_id):
+        """删除指定消息"""
+        if not self.ok:
+            return False
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{self.token}/deleteMessage",
+                data={"chat_id": self.chat_id, "message_id": message_id},
+                timeout=10
+            )
+            return r.json().get("ok", False)
+        except:
+            return False
+    
     def flush_updates(self):
         """刷新 offset 到最新，避免读到旧消息"""
         if not self.ok:
@@ -80,9 +97,10 @@ class Telegram:
         """
         等待你在 TG 里发 /code 123456
         只接受来自 TG_CHAT_ID 的消息
+        返回验证码和消息ID
         """
         if not self.ok:
-            return None
+            return None, None
         
         # 先刷新 offset，避免读到旧的 /code
         offset = self.flush_updates()
@@ -111,13 +129,30 @@ class Telegram:
                     text = (msg.get("text") or "").strip()
                     m = pattern.match(text)
                     if m:
-                        return m.group(1)
+                        return m.group(1), msg.get("message_id")
             
             except Exception:
                 pass
             
             time.sleep(2)
         
+        return None, None
+    
+    def send_and_get_message_id(self, msg):
+        """发送消息并返回消息ID"""
+        if not self.ok:
+            return None
+        try:
+            r = requests.post(
+                f"https://api.telegram.org/bot{self.token}/sendMessage",
+                data={"chat_id": self.chat_id, "text": msg, "parse_mode": "HTML"},
+                timeout=30
+            )
+            data = r.json()
+            if data.get("ok"):
+                return data.get("result", {}).get("message_id")
+        except:
+            pass
         return None
 
 
@@ -186,6 +221,9 @@ class AutoLogin:
         self.detected_region = None  # 检测到的区域，如 "ap-southeast-1"
         self.region_base_url = None  # 检测到的区域基础 URL
         
+        # 图片消息ID跟踪
+        self.verification_photo_message_id = None
+        
     def log(self, msg, level="INFO"):
         icons = {"INFO": "ℹ️", "SUCCESS": "✅", "ERROR": "❌", "WARN": "⚠️", "STEP": "🔹"}
         line = f"{icons.get(level, '•')} {msg}"
@@ -201,6 +239,19 @@ class AutoLogin:
         except:
             pass
         return f
+    
+    def delete_image_later(self, message_id):
+        """在指定延迟后删除图片消息"""
+        def delete_after_delay(msg_id, delay):
+            time.sleep(delay)
+            if self.tg.ok:
+                self.tg.delete_message(msg_id)
+                self.log(f"已删除验证页面图片消息 (ID: {msg_id})", "INFO")
+        
+        if message_id and self.tg.ok:
+            thread = threading.Thread(target=delete_after_delay, args=(message_id, IMAGE_DELETE_DELAY))
+            thread.daemon = True
+            thread.start()
     
     def click(self, page, sels, desc=""):
         for s in sels:
@@ -692,21 +743,46 @@ class AutoLogin:
             pass
 
         # 发送提示并等待验证码
-        self.tg.send(f"""🔐 <b>需要验证码登录</b>
+        msg = f"""🔐 <b>需要验证码登录</b>
 
 用户{self.username}正在登录，请在 Telegram 里发送：
 /code 你的6位验证码
 
-等待时间：{TWO_FACTOR_WAIT} 秒""")
+等待时间：{TWO_FACTOR_WAIT} 秒"""
+        self.tg.send(msg)
+        
+        # 发送图片并获取消息ID
+        photo_message_id = None
         if shot:
-            self.tg.photo(shot, "两步验证页面")
+            try:
+                # 使用文件发送方式获取消息ID
+                with open(shot, 'rb') as f:
+                    r = requests.post(
+                        f"https://api.telegram.org/bot{self.tg.token}/sendPhoto",
+                        data={"chat_id": self.tg.chat_id, "caption": "验证页面"},
+                        files={"photo": f},
+                        timeout=60
+                    )
+                    if r.status_code == 200:
+                        data = r.json()
+                        if data.get("ok"):
+                            photo_message_id = data.get("result", {}).get("message_id")
+                            self.verification_photo_message_id = photo_message_id
+                            self.log(f"已发送验证页面图片 (消息ID: {photo_message_id})", "SUCCESS")
+            except:
+                pass
 
         self.log(f"等待验证码（{TWO_FACTOR_WAIT}秒）...", "WARN")
-        code = self.tg.wait_code(timeout=TWO_FACTOR_WAIT)
+        code, code_message_id = self.tg.wait_code(timeout=TWO_FACTOR_WAIT)
 
         if not code:
             self.log("等待验证码超时", "ERROR")
             self.tg.send("❌ <b>等待验证码超时</b>")
+            
+            # 验证失败，3秒后删除验证页面图片
+            if photo_message_id:
+                self.delete_image_later(photo_message_id)
+            
             return False
 
         # 不打印验证码明文，只提示收到
@@ -777,6 +853,11 @@ class AutoLogin:
                                     error_text = error_el.inner_text()[:100]
                                     self.log(f"验证码错误: {error_text}", "ERROR")
                                     self.tg.send(f"❌ <b>验证码错误: {error_text}</b>")
+                                    
+                                    # 验证失败，3秒后删除验证页面图片
+                                    if photo_message_id:
+                                        self.delete_image_later(photo_message_id)
+                                    
                                     return False
                             except:
                                 pass
@@ -791,6 +872,11 @@ class AutoLogin:
                         if "two-factor" not in current_url and "login" not in current_url:
                             self.log("验证码验证通过！", "SUCCESS")
                             self.tg.send("✅ <b>验证码验证通过</b>")
+                            
+                            # 验证成功，3秒后删除验证页面图片
+                            if photo_message_id:
+                                self.delete_image_later(photo_message_id)
+                            
                             return True
                         else:
                             self.log("可能还在验证流程中", "WARN")
@@ -801,18 +887,38 @@ class AutoLogin:
                                 current_url = page.url
                                 if "github.com/sessions/two-factor/" not in current_url and "two-factor" not in current_url:
                                     self.log("验证码验证通过！", "SUCCESS")
+                                    
+                                    # 验证成功，3秒后删除验证页面图片
+                                    if photo_message_id:
+                                        self.delete_image_later(photo_message_id)
+                                    
                                     return True
                             self.log("仍然在验证页面，验证可能失败", "ERROR")
+                            
+                            # 验证失败，3秒后删除验证页面图片
+                            if photo_message_id:
+                                self.delete_image_later(photo_message_id)
+                            
                             return False
                     else:
                         self.log("验证码可能错误，仍然在验证页面", "ERROR")
                         self.tg.send("❌ <b>验证码可能错误，请检查后重试</b>")
+                        
+                        # 验证失败，3秒后删除验证页面图片
+                        if photo_message_id:
+                            self.delete_image_later(photo_message_id)
+                        
                         return False
             except:
                 pass
 
         self.log("没找到验证码输入框", "ERROR")
         self.tg.send("❌ <b>没找到验证码输入框</b>")
+        
+        # 验证失败，3秒后删除验证页面图片
+        if photo_message_id:
+            self.delete_image_later(photo_message_id)
+        
         return False
     
     def login_github(self, page, context):
@@ -980,8 +1086,6 @@ class AutoLogin:
                 for s in self.shots[-3:]:
                     self.tg.photo(s, s)
             else:
-                # for s in self.shots[-3:]:
-                #     self.tg.photo(s, s)
                 self.tg.photo(self.shots[-1], "完成")
     
     def run(self):
