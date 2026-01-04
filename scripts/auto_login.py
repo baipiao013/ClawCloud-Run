@@ -345,6 +345,28 @@ class AutoLogin:
             # 1. 检查是否已通过设备验证（邮箱或GitHub App）
             url = page.url
             if 'verified-device' not in url and 'device-verification' not in url:
+                # 检查是否有错误消息
+                try:
+                    error_selectors = [
+                        '.flash-error',
+                        '.js-flash-alert',
+                        '[role="alert"]',
+                        '.error'
+                    ]
+                    
+                    for error_sel in error_selectors:
+                        try:
+                            error_el = page.locator(error_sel).first
+                            if error_el.is_visible(timeout=1000):
+                                error_text = error_el.inner_text()[:100]
+                                self.log(f"发现错误: {error_text}", "ERROR")
+                                self.tg.send(f"❌ <b>发现错误: {error_text}</b>")
+                                return False
+                        except:
+                            pass
+                except:
+                    pass
+                
                 self.log("设备验证通过！", "SUCCESS")
                 self.tg.send("✅ <b>设备验证通过</b>（邮箱或GitHub App）")
                 return True
@@ -374,6 +396,26 @@ class AutoLogin:
         
         # 60秒后检查是否最终通过了设备验证
         if 'verified-device' not in page.url and 'device-verification' not in page.url:
+            # 检查是否有错误消息
+            try:
+                error_selectors = [
+                    '.flash-error',
+                    '.js-flash-alert',
+                    '[role="alert"]',
+                    '.error'
+                ]
+                
+                for error_sel in error_selectors:
+                    try:
+                        error_el = page.locator(error_sel).first
+                        if error_el.is_visible(timeout=1000):
+                            error_text = error_el.inner_text()[:100]
+                            self.log(f"发现错误: {error_text}", "ERROR")
+                            return False
+                    except:
+                        pass
+            except:
+                pass
             return True
         
         # 所有验证方式都超时
@@ -455,15 +497,52 @@ class AutoLogin:
                     page.wait_for_load_state('networkidle', timeout=30000)
                     self.shot(page, "验证码提交后")
                     
+                    # 检查是否有错误消息
+                    try:
+                        error_selectors = [
+                            '.flash-error',
+                            '.js-flash-alert',
+                            '[role="alert"]',
+                            '.error',
+                            'div:has-text("verification code")',
+                            'div:has-text("invalid")',
+                            'div:has-text("不正确")',
+                            'div:has-text("错误")'
+                        ]
+                        
+                        for error_sel in error_selectors:
+                            try:
+                                error_el = page.locator(error_sel).first
+                                if error_el.is_visible(timeout=2000):
+                                    error_text = error_el.inner_text()[:100]
+                                    self.log(f"验证码错误: {error_text}", "ERROR")
+                                    return False
+                            except:
+                                pass
+                    except:
+                        pass
+                    
                     # 检查是否通过
+                    time.sleep(2)  # 等待页面反应
                     url = page.url
                     if 'verified-device' not in url and 'device-verification' not in url:
-                        self.log("验证码验证通过！", "SUCCESS")
-                        self.tg.send("✅ <b>验证码验证通过</b>")
-                        return True
+                        # 再次确认确实离开了验证页面
+                        if 'two-factor' not in url and 'login' not in url:
+                            self.log("验证码验证通过！", "SUCCESS")
+                            self.tg.send("✅ <b>验证码验证通过</b>")
+                            return True
+                        else:
+                            self.log("可能还在验证流程中", "WARN")
+                            # 继续等待一小段时间确认
+                            for _ in range(5):
+                                time.sleep(1)
+                                current_url = page.url
+                                if 'verified-device' not in current_url and 'device-verification' not in current_url:
+                                    self.log("验证码验证通过！", "SUCCESS")
+                                    return True
+                            return False
                     else:
-                        self.log("验证码可能错误", "WARN")
-                        # 验证码错误，但可能还有其他验证方式在进行
+                        self.log("验证码可能错误，仍然在验证页面", "WARN")
                         return self.continue_wait_device(page)
             except:
                 pass
@@ -483,6 +562,27 @@ class AutoLogin:
             # 检查是否已通过设备验证
             url = page.url
             if 'verified-device' not in url and 'device-verification' not in url:
+                # 检查是否有错误消息
+                try:
+                    error_selectors = [
+                        '.flash-error',
+                        '.js-flash-alert',
+                        '[role="alert"]',
+                        '.error'
+                    ]
+                    
+                    for error_sel in error_selectors:
+                        try:
+                            error_el = page.locator(error_sel).first
+                            if error_el.is_visible(timeout=1000):
+                                error_text = error_el.inner_text()[:100]
+                                self.log(f"发现错误: {error_text}", "ERROR")
+                                return False
+                        except:
+                            pass
+                except:
+                    pass
+                
                 self.log("设备验证通过！", "SUCCESS")
                 self.tg.send("✅ <b>设备验证通过</b>")
                 return True
@@ -595,7 +695,7 @@ class AutoLogin:
         self.tg.send(f"""🔐 <b>需要验证码登录</b>
 
 用户{self.username}正在登录，请在 Telegram 里发送：
-<code>/code 你的6位验证码</code>
+<code>/code</code> 你的6位验证码
 
 等待时间：{TWO_FACTOR_WAIT} 秒""")
         if shot:
@@ -656,14 +756,56 @@ class AutoLogin:
                     time.sleep(3)
                     page.wait_for_load_state('networkidle', timeout=30000)
                     self.shot(page, "验证码提交后")
+                    
+                    # 检查是否有错误消息（验证码错误）
+                    try:
+                        error_selectors = [
+                            '.flash-error',
+                            '.js-flash-alert',
+                            '[role="alert"]',
+                            '.error',
+                            'div:has-text("verification code")',
+                            'div:has-text("invalid")',
+                            'div:has-text("不正确")',
+                            'div:has-text("错误")'
+                        ]
+                        
+                        for error_sel in error_selectors:
+                            try:
+                                error_el = page.locator(error_sel).first
+                                if error_el.is_visible(timeout=2000):
+                                    error_text = error_el.inner_text()[:100]
+                                    self.log(f"验证码错误: {error_text}", "ERROR")
+                                    self.tg.send(f"❌ <b>验证码错误: {error_text}</b>")
+                                    return False
+                            except:
+                                pass
+                    except:
+                        pass
 
                     # 检查是否通过
-                    if "github.com/sessions/two-factor/" not in page.url:
-                        self.log("验证码验证通过！", "SUCCESS")
-                        self.tg.send("✅ <b>验证码验证通过</b>")
-                        return True
+                    time.sleep(2)  # 等待页面反应
+                    current_url = page.url
+                    if "github.com/sessions/two-factor/" not in current_url:
+                        # 再次确认确实离开了验证页面
+                        if "two-factor" not in current_url and "login" not in current_url:
+                            self.log("验证码验证通过！", "SUCCESS")
+                            self.tg.send("✅ <b>验证码验证通过</b>")
+                            return True
+                        else:
+                            self.log("可能还在验证流程中", "WARN")
+                            # 可能还需要点击下一步或其他操作
+                            # 等待几秒再次检查
+                            for _ in range(5):
+                                time.sleep(1)
+                                current_url = page.url
+                                if "github.com/sessions/two-factor/" not in current_url and "two-factor" not in current_url:
+                                    self.log("验证码验证通过！", "SUCCESS")
+                                    return True
+                            self.log("仍然在验证页面，验证可能失败", "ERROR")
+                            return False
                     else:
-                        self.log("验证码可能错误", "ERROR")
+                        self.log("验证码可能错误，仍然在验证页面", "ERROR")
                         self.tg.send("❌ <b>验证码可能错误，请检查后重试</b>")
                         return False
             except:
