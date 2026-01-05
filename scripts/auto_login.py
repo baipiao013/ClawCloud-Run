@@ -5,7 +5,7 @@ ClawCloud 自动登录脚本
 - 每次登录后自动更新 Cookie
 - Telegram 通知
 - 支持验证码验证
-- 验证页面图片在3秒后自动删除
+- 验证页面图片通过文本定位自动删除
 """
 
 import base64
@@ -26,6 +26,17 @@ SIGNIN_URL = f"{LOGIN_ENTRY_URL}/signin"
 DEVICE_VERIFY_WAIT = 30  # Mobile验证 默认等 30 秒
 TWO_FACTOR_WAIT = int(os.environ.get("TWO_FACTOR_WAIT", "120"))  # 2FA验证 默认等 120 秒
 IMAGE_DELETE_DELAY = 3  # 验证页面图片在3秒后自动删除
+
+# 用于识别验证图片的消息文本关键词
+VERIFICATION_TEXT_PATTERNS = [
+    "设备验证页面",          # 设备验证图片的标题
+    "两步验证页面",          # 2FA图片的标题
+    "验证页面",              # 通用验证页面
+    "切换到验证码输入页",     # 切换后的验证页面
+    "点击more_options后",    # 更多选项页面
+    "两步验证_code",         # 验证码页面
+    "两步验证_mobile",       # Mobile验证页面
+]
 
 
 class Telegram:
@@ -86,9 +97,97 @@ class Telegram:
             data = r.json()
             if data.get("ok"):
                 return True
+            else:
+                error = data.get("description", "未知错误")
+                print(f"删除消息失败: {error}")
         except Exception as e:
-            print(f"删除消息失败: {e}")
+            print(f"删除消息异常: {e}")
         return False
+    
+    def get_recent_messages(self, limit=20):
+        """获取最近的聊天消息"""
+        if not self.ok:
+            return []
+        
+        try:
+            # 使用 getUpdates 获取最新消息
+            r = requests.get(
+                f"https://api.telegram.org/bot{self.token}/getUpdates",
+                params={"limit": limit, "offset": -1, "timeout": 0},
+                timeout=10
+            )
+            data = r.json()
+            if data.get("ok"):
+                messages = []
+                for update in data.get("result", []):
+                    if "message" in update:
+                        msg = update["message"]
+                        chat = msg.get("chat", {})
+                        # 只返回当前聊天室的消息
+                        if str(chat.get("id")) == str(self.chat_id):
+                            messages.append({
+                                "message_id": msg.get("message_id"),
+                                "text": msg.get("text", ""),
+                                "caption": msg.get("caption", ""),
+                                "photo": "photo" in msg,
+                                "date": msg.get("date")
+                            })
+                return messages
+        except Exception as e:
+            print(f"获取消息失败: {e}")
+        
+        return []
+    
+    def find_verification_messages(self):
+        """查找所有验证相关的消息（通过文本匹配）"""
+        if not self.ok:
+            return []
+        
+        try:
+            # 获取最近的消息
+            messages = self.get_recent_messages(limit=30)
+            verification_messages = []
+            
+            for msg in messages:
+                # 检查消息文本或标题是否包含验证关键词
+                text_to_check = ""
+                if msg.get("text"):
+                    text_to_check += msg["text"] + " "
+                if msg.get("caption"):
+                    text_to_check += msg["caption"]
+                
+                # 检查是否匹配任何验证关键词
+                for pattern in VERIFICATION_TEXT_PATTERNS:
+                    if pattern in text_to_check:
+                        verification_messages.append(msg["message_id"])
+                        print(f"找到验证消息: ID={msg['message_id']}, 文本='{text_to_check[:50]}...'")
+                        break
+            
+            return verification_messages
+            
+        except Exception as e:
+            print(f"查找验证消息失败: {e}")
+            return []
+    
+    def delete_verification_messages(self):
+        """删除所有验证相关的消息"""
+        if not self.ok:
+            return 0
+        
+        deleted_count = 0
+        verification_message_ids = self.find_verification_messages()
+        
+        for msg_id in verification_message_ids:
+            if self.delete_message(msg_id):
+                deleted_count += 1
+                print(f"已删除验证消息: ID={msg_id}")
+            else:
+                print(f"删除验证消息失败: ID={msg_id}")
+            
+            # 避免速率限制
+            time.sleep(0.2)
+        
+        return deleted_count
     
     def flush_updates(self):
         """刷新 offset 到最新，避免读到旧消息"""
@@ -237,23 +336,20 @@ class AutoLogin:
             pass
         return f
     
-    def schedule_delete_messages(self):
-        """安排删除之前标记的消息"""
-        if not self.verification_messages_to_delete:
+    def schedule_delete_verification_messages(self):
+        """安排删除所有验证相关的消息"""
+        if not self.tg.ok:
             return
         
-        message_ids = self.verification_messages_to_delete.copy()
-        self.verification_messages_to_delete.clear()
-        
-        def delete_after_delay(msg_ids, delay):
+        def delete_after_delay(delay):
             time.sleep(delay)
-            for msg_id in msg_ids:
-                if self.tg.delete_message(msg_id):
-                    self.log(f"已删除验证页面图片消息 (ID: {msg_id})", "INFO")
-                else:
-                    self.log(f"删除消息失败 (ID: {msg_id})", "WARN")
+            deleted_count = self.tg.delete_verification_messages()
+            if deleted_count > 0:
+                self.log(f"已删除 {deleted_count} 条验证消息", "INFO")
+            else:
+                self.log("未找到需要删除的验证消息", "INFO")
         
-        thread = threading.Thread(target=delete_after_delay, args=(message_ids, IMAGE_DELETE_DELAY))
+        thread = threading.Thread(target=delete_after_delay, args=(IMAGE_DELETE_DELAY,))
         thread.daemon = True
         thread.start()
     
@@ -381,7 +477,7 @@ class AutoLogin:
         self.log(f"需要设备验证，等待 {DEVICE_VERIFY_WAIT} 秒...", "WARN")
         self.shot(page, "设备验证")
         
-        device_msg_id = self.tg.send(f"""⚠️ <b>需要设备验证</b>
+        self.tg.send(f"""⚠️ <b>需要设备验证</b>
 
 请在 {DEVICE_VERIFY_WAIT} 秒内通过以下任一方式验证：
 1️⃣ 检查邮箱点击链接
@@ -390,14 +486,9 @@ class AutoLogin:
 
 等待时间：{DEVICE_VERIFY_WAIT} 秒""")
         
-        # 记录设备验证消息ID，稍后删除
-        if device_msg_id:
-            self.verification_messages_to_delete.append(device_msg_id)
-        
         if self.shots:
-            photo_msg_id = self.tg.photo(self.shots[-1], "设备验证页面")
-            if photo_msg_id:
-                self.verification_messages_to_delete.append(photo_msg_id)
+            # 发送设备验证页面图片
+            self.tg.photo(self.shots[-1], "设备验证页面")
         
         # 刷新 Telegram 更新，避免读取旧消息
         offset = self.tg.flush_updates() if self.tg.ok else 0
@@ -421,9 +512,7 @@ class AutoLogin:
                             if error_el.is_visible(timeout=1000):
                                 error_text = error_el.inner_text()[:100]
                                 self.log(f"发现错误: {error_text}", "ERROR")
-                                error_msg_id = self.tg.send(f"❌ <b>发现错误: {error_text}</b>")
-                                if error_msg_id:
-                                    self.verification_messages_to_delete.append(error_msg_id)
+                                self.tg.send(f"❌ <b>发现错误: {error_text}</b>")
                                 return False
                         except:
                             pass
@@ -431,9 +520,7 @@ class AutoLogin:
                     pass
                 
                 self.log("设备验证通过！", "SUCCESS")
-                success_msg_id = self.tg.send("✅ <b>设备验证通过</b>（邮箱或GitHub App）")
-                if success_msg_id:
-                    self.verification_messages_to_delete.append(success_msg_id)
+                self.tg.send("✅ <b>设备验证通过</b>（邮箱或GitHub App）")
                 return True
             
             # 2. 检查Telegram是否有验证码消息
@@ -444,9 +531,7 @@ class AutoLogin:
                     if offset > 0:
                         offset += 1
                     self.log(f"收到验证码，尝试使用验证码验证", "SUCCESS")
-                    code_msg_id = self.tg.send("✅ <b>收到验证码，尝试使用验证码验证</b>")
-                    if code_msg_id:
-                        self.verification_messages_to_delete.append(code_msg_id)
+                    self.tg.send("✅ <b>收到验证码，尝试使用验证码验证</b>")
                     # 使用验证码验证
                     return self.handle_2fa_code_input_for_device_verification(page, code)
             
@@ -487,9 +572,7 @@ class AutoLogin:
         
         # 所有验证方式都超时
         self.log("所有验证方式均超时", "ERROR")
-        timeout_msg_id = self.tg.send("❌ <b>所有验证方式均超时</b>")
-        if timeout_msg_id:
-            self.verification_messages_to_delete.append(timeout_msg_id)
+        self.tg.send("❌ <b>所有验证方式均超时</b>")
         return False
     
     def handle_2fa_code_input_for_device_verification(self, page, code):
@@ -598,9 +681,7 @@ class AutoLogin:
                         # 再次确认确实离开了验证页面
                         if 'two-factor' not in url and 'login' not in url:
                             self.log("验证码验证通过！", "SUCCESS")
-                            success_msg_id = self.tg.send("✅ <b>验证码验证通过</b>")
-                            if success_msg_id:
-                                self.verification_messages_to_delete.append(success_msg_id)
+                            self.tg.send("✅ <b>验证码验证通过</b>")
                             return True
                         else:
                             self.log("可能还在验证流程中", "WARN")
@@ -655,9 +736,7 @@ class AutoLogin:
                     pass
                 
                 self.log("设备验证通过！", "SUCCESS")
-                success_msg_id = self.tg.send("✅ <b>设备验证通过</b>")
-                if success_msg_id:
-                    self.verification_messages_to_delete.append(success_msg_id)
+                self.tg.send("✅ <b>设备验证通过</b>")
                 return True
         
         self.log("验证失败", "ERROR")
@@ -669,23 +748,12 @@ class AutoLogin:
         
         # 先截图并立刻发出去（让你看到数字）
         shot = self.shot(page, "两步验证_mobile")
-        
-        # 发送文本消息
-        msg_id = self.tg.send(f"""⚠️ <b>需要两步验证（GitHub Mobile）</b>
+        self.tg.send(f"""⚠️ <b>需要两步验证（GitHub Mobile）</b>
 
 请打开手机 GitHub App 批准本次登录（会让你确认一个数字）。
 等待时间：{TWO_FACTOR_WAIT} 秒""")
-        
-        # 记录文本消息ID
-        if msg_id:
-            self.verification_messages_to_delete.append(msg_id)
-        
-        # 发送图片
-        photo_msg_id = None
         if shot:
-            photo_msg_id = self.tg.photo(shot, "两步验证页面（数字在图里）")
-            if photo_msg_id:
-                self.verification_messages_to_delete.append(photo_msg_id)
+            self.tg.photo(shot, "两步验证页面（数字在图里）")
         
         # 不要频繁 reload，避免把流程刷回登录页
         for i in range(TWO_FACTOR_WAIT):
@@ -696,17 +764,12 @@ class AutoLogin:
             # 如果离开 two-factor 流程页面，认为通过
             if "github.com/sessions/two-factor/" not in url:
                 self.log("两步验证通过！", "SUCCESS")
-                success_msg_id = self.tg.send("✅ <b>两步验证通过</b>")
-                if success_msg_id:
-                    self.verification_messages_to_delete.append(success_msg_id)
+                self.tg.send("✅ <b>两步验证通过</b>")
                 return True
             
             # 如果被刷回登录页，说明这次流程断了（不要硬等）
             if "github.com/login" in url:
                 self.log("两步验证后回到了登录页，需重新登录", "ERROR")
-                error_msg_id = self.tg.send("❌ <b>两步验证后回到了登录页，需重新登录</b>")
-                if error_msg_id:
-                    self.verification_messages_to_delete.append(error_msg_id)
                 return False
             
             # 每 10 秒打印一次，并补发一次截图（防止你没看到数字）
@@ -714,10 +777,7 @@ class AutoLogin:
                 self.log(f"  等待... ({i}/{TWO_FACTOR_WAIT}秒)")
                 shot = self.shot(page, f"两步验证_{i}s")
                 if shot:
-                    # 可以补发截图，但也会被记录
-                    new_photo_msg_id = self.tg.photo(shot, f"两步验证页面（第{i}秒）")
-                    if new_photo_msg_id:
-                        self.verification_messages_to_delete.append(new_photo_msg_id)
+                    self.tg.photo(shot, f"两步验证页面（第{i}秒）")
             
             # 只在 30 秒、60 秒... 做一次轻刷新（可选，频率很低）
             if i % 30 == 0 and i != 0:
@@ -728,9 +788,7 @@ class AutoLogin:
                     pass
         
         self.log("两步验证超时", "ERROR")
-        timeout_msg_id = self.tg.send("❌ <b>两步验证超时</b>")
-        if timeout_msg_id:
-            self.verification_messages_to_delete.append(timeout_msg_id)
+        self.tg.send("❌ <b>两步验证超时</b>")
         return False
     
     def handle_2fa_code_input(self, page):
@@ -786,44 +844,32 @@ class AutoLogin:
             pass
 
         # 发送提示并等待验证码
-        msg = f"""🔐 <b>需要验证码登录</b>
+        self.tg.send(f"""🔐 <b>需要验证码登录</b>
 
 用户{self.username}正在登录，请在 Telegram 里发送：
 /code 你的6位验证码
 
-等待时间：{TWO_FACTOR_WAIT} 秒"""
+等待时间：{TWO_FACTOR_WAIT} 秒""")
         
-        # 发送文本消息
-        text_msg_id = self.tg.send(msg)
-        if text_msg_id:
-            self.verification_messages_to_delete.append(text_msg_id)
-        
-        # 发送图片并获取消息ID
-        photo_msg_id = None
+        # 发送验证页面图片
         if shot:
-            photo_msg_id = self.tg.photo(shot, "验证页面")
-            if photo_msg_id:
-                self.verification_messages_to_delete.append(photo_msg_id)
+            self.tg.photo(shot, "验证页面")
 
         self.log(f"等待验证码（{TWO_FACTOR_WAIT}秒）...", "WARN")
         code, code_message_id = self.tg.wait_code(timeout=TWO_FACTOR_WAIT)
 
         if not code:
             self.log("等待验证码超时", "ERROR")
-            timeout_msg_id = self.tg.send("❌ <b>等待验证码超时</b>")
-            if timeout_msg_id:
-                self.verification_messages_to_delete.append(timeout_msg_id)
+            self.tg.send("❌ <b>等待验证码超时</b>")
             
             # 安排删除验证消息
-            self.schedule_delete_messages()
+            self.schedule_delete_verification_messages()
             
             return False
 
         # 不打印验证码明文，只提示收到
         self.log("收到验证码，正在填入...", "SUCCESS")
-        received_msg_id = self.tg.send("✅ 收到验证码，正在填入...")
-        if received_msg_id:
-            self.verification_messages_to_delete.append(received_msg_id)
+        self.tg.send("✅ 收到验证码，正在填入...")
 
         # 常见 OTP 输入框 selector（优先级排序）
         selectors = [
@@ -888,12 +934,10 @@ class AutoLogin:
                                 if error_el.is_visible(timeout=2000):
                                     error_text = error_el.inner_text()[:100]
                                     self.log(f"验证码错误: {error_text}", "ERROR")
-                                    error_msg_id = self.tg.send(f"❌ <b>验证码错误: {error_text}</b>")
-                                    if error_msg_id:
-                                        self.verification_messages_to_delete.append(error_msg_id)
+                                    self.tg.send(f"❌ <b>验证码错误: {error_text}</b>")
                                     
                                     # 安排删除验证消息
-                                    self.schedule_delete_messages()
+                                    self.schedule_delete_verification_messages()
                                     
                                     return False
                             except:
@@ -908,12 +952,10 @@ class AutoLogin:
                         # 再次确认确实离开了验证页面
                         if "two-factor" not in current_url and "login" not in current_url:
                             self.log("验证码验证通过！", "SUCCESS")
-                            success_msg_id = self.tg.send("✅ <b>验证码验证通过</b>")
-                            if success_msg_id:
-                                self.verification_messages_to_delete.append(success_msg_id)
+                            self.tg.send("✅ <b>验证码验证通过</b>")
                             
                             # 安排删除验证消息
-                            self.schedule_delete_messages()
+                            self.schedule_delete_verification_messages()
                             
                             return True
                         else:
@@ -927,35 +969,31 @@ class AutoLogin:
                                     self.log("验证码验证通过！", "SUCCESS")
                                     
                                     # 安排删除验证消息
-                                    self.schedule_delete_messages()
+                                    self.schedule_delete_verification_messages()
                                     
                                     return True
                             self.log("仍然在验证页面，验证可能失败", "ERROR")
                             
                             # 安排删除验证消息
-                            self.schedule_delete_messages()
+                            self.schedule_delete_verification_messages()
                             
                             return False
                     else:
                         self.log("验证码可能错误，仍然在验证页面", "ERROR")
-                        error_msg_id = self.tg.send("❌ <b>验证码可能错误，请检查后重试</b>")
-                        if error_msg_id:
-                            self.verification_messages_to_delete.append(error_msg_id)
+                        self.tg.send("❌ <b>验证码可能错误，请检查后重试</b>")
                         
                         # 安排删除验证消息
-                        self.schedule_delete_messages()
+                        self.schedule_delete_verification_messages()
                         
                         return False
             except:
                 pass
 
         self.log("没找到验证码输入框", "ERROR")
-        error_msg_id = self.tg.send("❌ <b>没找到验证码输入框</b>")
-        if error_msg_id:
-            self.verification_messages_to_delete.append(error_msg_id)
+        self.tg.send("❌ <b>没找到验证码输入框</b>")
         
         # 安排删除验证消息
-        self.schedule_delete_messages()
+        self.schedule_delete_verification_messages()
         
         return False
     
@@ -1263,9 +1301,8 @@ class AutoLogin:
                 self.notify(False, str(e))
                 sys.exit(1)
             finally:
-                # 确保在退出前安排删除所有待删除的消息
-                if self.verification_messages_to_delete:
-                    self.schedule_delete_messages()
+                # 确保在退出前安排删除所有验证消息
+                self.schedule_delete_verification_messages()
                 browser.close()
 
 
