@@ -104,7 +104,7 @@ class Telegram:
                     offset = upd["update_id"] + 1
                     msg = upd.get("message") or {}
                     chat = msg.get("chat") or {}
-                    if str(chat.get("id")) != str(self.tg.chat_id):
+                    if str(chat.get("id")) != str(self.chat_id):
                         continue
                     
                     text = (msg.get("text") or "").strip()
@@ -298,7 +298,7 @@ class AutoLogin:
         
         self.tg.send(f"""⚠️ <b>需要设备验证</b>
 
-请在 {DEVICE_VERIFY_WAIT} 秒内批准：
+用户{self.username}正在登录，请在 {DEVICE_VERIFY_WAIT} 秒内批准：
 1️⃣ 检查邮箱点击链接
 2️⃣ 或在 GitHub App 批准
 3️⃣ 在 Telegram 发送 /code 验证码""")
@@ -572,132 +572,19 @@ class AutoLogin:
                         page.keyboard.press("Enter")
                         self.log("已按 Enter 提交", "SUCCESS")
 
-                    # 等待页面响应
                     time.sleep(3)
                     page.wait_for_load_state('networkidle', timeout=30000)
                     self.shot(page, "验证码提交后")
 
-                    # ========== 关键修复：更严格的验证逻辑 ==========
-                    # 等待足够的时间让错误消息出现
-                    time.sleep(2)
-                    
-                    # 检查是否有明显的错误提示
-                    try:
-                        # GitHub 验证码错误的常见提示元素
-                        error_selectors = [
-                            '.flash-error',
-                            '.js-flash-alert',
-                            '[role="alert"]',
-                            '.auth-form-body .error',
-                            '#js-flash-container .flash',
-                            'div.Banner--error',
-                            'div[aria-live="polite"][aria-atomic="true"]'
-                        ]
-                        
-                        for error_sel in error_selectors:
-                            try:
-                                error_elements = page.locator(error_sel)
-                                count = error_elements.count()
-                                for i in range(count):
-                                    try:
-                                        error_element = error_elements.nth(i)
-                                        if error_element.is_visible(timeout=1000):
-                                            error_text = error_element.inner_text().lower()
-                                            # 检查错误关键词
-                                            error_keywords = ['incorrect', 'invalid', 'wrong', 'error', 'try again', 
-                                                             'retry', 'failed', '无法验证', '验证失败', '错误']
-                                            
-                                            for keyword in error_keywords:
-                                                if keyword in error_text:
-                                                    self.log(f"验证码错误: {error_text[:50]}...", "ERROR")
-                                                    self.tg.send(f"❌ <b>验证码错误</b>\n\n{error_text[:100]}")
-                                                    # 再次截图错误页面
-                                                    self.shot(page, "验证码错误")
-                                                    return False
-                                    except:
-                                        pass
-                            except:
-                                pass
-                    except Exception as e:
-                        self.log(f"检查错误时出错: {e}", "WARN")
-
-                    # 检查是否还在两步验证页面
-                    current_url = page.url
-                    if "github.com/sessions/two-factor/" in current_url:
-                        # 还在两步验证页面，检查是否有成功迹象
-                        try:
-                            # 检查页面标题或内容是否提示错误
-                            page_title = page.title()
-                            if "verification failed" in page_title.lower() or "authentication failed" in page_title.lower():
-                                self.log("页面标题提示验证失败", "ERROR")
-                                self.tg.send("❌ <b>页面标题提示验证失败</b>")
-                                return False
-                        except:
-                            pass
-                        
-                        # 检查是否有重试或返回按钮（错误状态常见）
-                        try:
-                            retry_buttons = page.locator('button:has-text("Try again"), button:has-text("Retry"), a:has-text("Go back")')
-                            if retry_buttons.count() > 0 and retry_buttons.first.is_visible(timeout=1000):
-                                self.log("发现重试/返回按钮，验证可能失败", "ERROR")
-                                self.tg.send("❌ <b>验证失败，请重试</b>")
-                                return False
-                        except:
-                            pass
-                        
-                        # 如果还在两步验证页面且没有明显错误，但仍然停留在此页面，很可能是验证失败
-                        # 等待额外时间确认
-                        time.sleep(5)
-                        current_url = page.url
-                        if "github.com/sessions/two-factor/" in current_url:
-                            self.log("仍在两步验证页面，验证码可能错误", "ERROR")
-                            self.tg.send("❌ <b>验证失败：仍在两步验证页面</b>")
-                            return False
-                    
-                    # 检查是否跳转到成功页面
-                    current_url = page.url
-                    success_urls = [
-                        "github.com/login/oauth/authorize",
-                        "claw.cloud",
-                        "github.com/sessions/verified-device"
-                    ]
-                    
-                    for success_url in success_urls:
-                        if success_url in current_url:
-                            self.log("验证码验证通过！", "SUCCESS")
-                            self.tg.send("✅ <b>验证码验证通过</b>")
-                            return True
-                    
-                    # 检查是否有授权按钮（GitHub OAuth）
-                    try:
-                        authorize_button = page.locator('button[name="authorize"]').first
-                        if authorize_button.is_visible(timeout=2000):
-                            self.log("验证成功，显示授权按钮", "SUCCESS")
-                            self.tg.send("✅ <b>验证成功，等待授权</b>")
-                            return True
-                    except:
-                        pass
-                    
-                    # 检查是否有登录成功迹象（如用户名显示）
-                    try:
-                        logged_in_indicator = page.locator('[aria-label="Account"], .Header-item--full, .user-profile-link')
-                        if logged_in_indicator.count() > 0 and logged_in_indicator.first.is_visible(timeout=2000):
-                            self.log("检测到登录成功迹象", "SUCCESS")
-                            self.tg.send("✅ <b>登录成功</b>")
-                            return True
-                    except:
-                        pass
-                    
-                    # 如果以上检查都未通过，但页面已离开两步验证，可能是未知状态
-                    if "github.com/sessions/two-factor/" not in current_url:
-                        self.log(f"已离开两步验证页面，当前URL: {current_url[:50]}...", "SUCCESS")
-                        self.tg.send(f"✅ <b>验证通过</b>\n\n当前页面: {current_url[:100]}")
+                    # 检查是否通过
+                    if "github.com/sessions/two-factor/" not in page.url:
+                        self.log("验证码验证通过！", "SUCCESS")
+                        self.tg.send("✅ <b>验证码验证通过</b>")
                         return True
-                    
-                    # 默认情况：不确定状态
-                    self.log("验证状态不确定", "WARN")
-                    self.tg.send("⚠️ <b>验证状态不确定，请手动检查</b>")
-                    return False
+                    else:
+                        self.log("验证码可能错误", "ERROR")
+                        self.tg.send("❌ <b>验证码可能错误，请检查后重试</b>")
+                        return False
             except:
                 pass
 
