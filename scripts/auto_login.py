@@ -4,7 +4,6 @@ ClawCloud 自动登录脚本
 - 等待设备验证批准（30秒）
 - 每次登录后自动更新 Cookie
 - Telegram 通知
-- 支持验证码验证
 """
 
 import base64
@@ -292,302 +291,122 @@ class AutoLogin:
 """)
             self.log("已通过 Telegram 发送 Cookie", "SUCCESS")
     
-    def check_telegram_code(self, offset):
-        """检查Telegram是否有验证码消息"""
-        if not self.tg.ok:
-            return None
-        
-        try:
-            r = requests.get(
-                f"https://api.telegram.org/bot{self.tg.token}/getUpdates",
-                params={"timeout": 0, "offset": offset},
-                timeout=5
-            )
-            data = r.json()
-            if data.get("ok") and data.get("result"):
-                for upd in data.get("result", []):
-                    msg = upd.get("message") or {}
-                    chat = msg.get("chat") or {}
-                    if str(chat.get("id")) != str(self.tg.chat_id):
-                        continue
-                    
-                    text = (msg.get("text") or "").strip()
-                    pattern = re.compile(r"^/code\s+(\d{6,8})$")
-                    m = pattern.match(text)
-                    if m:
-                        return m.group(1)
-        except:
-            pass
-        
-        return None
-    
     def wait_device(self, page):
-        """等待设备验证 - 支持三种验证方式：邮箱、GitHub App、验证码"""
+        """等待设备验证"""
         self.log(f"需要设备验证，等待 {DEVICE_VERIFY_WAIT} 秒...", "WARN")
         self.shot(page, "设备验证")
         
         self.tg.send(f"""⚠️ <b>需要设备验证</b>
 
-用户{self.username}正在登录，请在 {DEVICE_VERIFY_WAIT} 秒内通过以下任一方式验证：
+请在 {DEVICE_VERIFY_WAIT} 秒内批准：
 1️⃣ 检查邮箱点击链接
-2️⃣ 在 GitHub App 批准
-3️⃣ 在 Telegram 发送 /code 验证码
-
-等待时间：{DEVICE_VERIFY_WAIT} 秒""")
+2️⃣ 或在 GitHub App 批准
+3️⃣ 在 Telegram 发送 /code 验证码""")
         
         if self.shots:
             self.tg.photo(self.shots[-1], "设备验证页面")
         
-        # 刷新 Telegram 更新，避免读取旧消息
-        offset = self.tg.flush_updates() if self.tg.ok else 0
+        # 先刷新 offset，避免读到旧的 /code
+        offset = self.tg.flush_updates()
+        pattern = re.compile(r"^/code\s+(\d+)$")
+        deadline = time.time() + DEVICE_VERIFY_WAIT
         
         for i in range(DEVICE_VERIFY_WAIT):
-            # 1. 检查是否已通过设备验证（邮箱或GitHub App）
-            url = page.url
-            if 'verified-device' not in url and 'device-verification' not in url:
-                # 检查是否有错误消息
-                try:
-                    error_selectors = [
-                        '.flash-error',
-                        '.js-flash-alert',
-                        '[role="alert"]',
-                        '.error'
-                    ]
-                    
-                    for error_sel in error_selectors:
-                        try:
-                            error_el = page.locator(error_sel).first
-                            if error_el.is_visible(timeout=1000):
-                                error_text = error_el.inner_text()[:100]
-                                self.log(f"发现错误: {error_text}", "ERROR")
-                                self.tg.send(f"❌ <b>发现错误: {error_text}</b>")
-                                return False
-                        except:
-                            pass
-                except:
-                    pass
-                
-                self.log("设备验证通过！", "SUCCESS")
-                self.tg.send("✅ <b>设备验证通过</b>（邮箱或GitHub App）")
-                return True
-            
-            # 2. 检查Telegram是否有验证码消息
-            if self.tg.ok:
-                code = self.check_telegram_code(offset)
-                if code:
-                    # 更新offset以避免重复读取
-                    if offset > 0:
-                        offset += 1
-                    self.log(f"收到验证码，尝试使用验证码验证", "SUCCESS")
-                    self.tg.send("✅ <b>收到验证码，尝试使用验证码验证</b>")
-                    # 使用验证码验证
-                    return self.handle_2fa_code_input_for_device_verification(page, code)
-            
             time.sleep(1)
             
-            # 每5秒打印一次等待状态
+            # 检查是否有 Telegram 消息
+            if self.tg.ok:
+                try:
+                    r = requests.get(
+                        f"https://api.telegram.org/bot{self.tg.token}/getUpdates",
+                        params={"timeout": 0, "offset": offset},
+                        timeout=10
+                    )
+                    data = r.json()
+                    if data.get("ok"):
+                        for upd in data.get("result", []):
+                            offset = upd["update_id"] + 1
+                            msg = upd.get("message") or {}
+                            chat = msg.get("chat") or {}
+                            if str(chat.get("id")) != str(self.tg.chat_id):
+                                continue
+                            
+                            text = (msg.get("text") or "").strip()
+                            m = pattern.match(text)
+                            if m:
+                                code = m.group(1)
+                                self.log(f"收到验证码: {code}", "SUCCESS")
+                                self.tg.send("✅ 收到设备验证码，正在处理...")
+                                
+                                # 尝试找到验证码输入框
+                                selectors = [
+                                    'input[type="text"]',
+                                    'input[name="otp"]',
+                                    'input[name="code"]',
+                                    'input[inputmode="numeric"]',
+                                    'input#otp',
+                                    'input#code'
+                                ]
+                                
+                                found = False
+                                for sel in selectors:
+                                    try:
+                                        el = page.locator(sel).first
+                                        if el.is_visible(timeout=2000):
+                                            el.fill(code)
+                                            self.log("已填入验证码", "SUCCESS")
+                                            
+                                            # 提交
+                                            submit_btns = [
+                                                'button[type="submit"]',
+                                                'button:has-text("Verify")',
+                                                'button:has-text("Submit")'
+                                            ]
+                                            for btn_sel in submit_btns:
+                                                try:
+                                                    btn = page.locator(btn_sel).first
+                                                    if btn.is_visible(timeout=1000):
+                                                        btn.click()
+                                                        self.log("已提交验证码", "SUCCESS")
+                                                        found = True
+                                                        break
+                                                except:
+                                                    pass
+                                            
+                                            if not found:
+                                                page.keyboard.press("Enter")
+                                                self.log("已按 Enter 提交", "SUCCESS")
+                                            
+                                            time.sleep(3)
+                                            page.wait_for_load_state('networkidle', timeout=30000)
+                                            break
+                                    except:
+                                        pass
+                                
+                                return True
+                except:
+                    pass
+            
+            # 检查是否已通过
+            url = page.url
+            if 'verified-device' not in url and 'device-verification' not in url:
+                self.log("设备验证通过！", "SUCCESS")
+                self.tg.send("✅ <b>设备验证通过</b>")
+                return True
+            
             if i % 5 == 0:
-                self.log(f"  等待验证... ({i}/{DEVICE_VERIFY_WAIT}秒)")
+                self.log(f"  等待... ({i}/{DEVICE_VERIFY_WAIT}秒)")
                 try:
                     page.reload(timeout=10000)
                     page.wait_for_load_state('networkidle', timeout=10000)
                 except:
                     pass
         
-        # 60秒后检查是否最终通过了设备验证
-        if 'verified-device' not in page.url and 'device-verification' not in page.url:
-            # 检查是否有错误消息
-            try:
-                error_selectors = [
-                    '.flash-error',
-                    '.js-flash-alert',
-                    '[role="alert"]',
-                    '.error'
-                ]
-                
-                for error_sel in error_selectors:
-                    try:
-                        error_el = page.locator(error_sel).first
-                        if error_el.is_visible(timeout=1000):
-                            error_text = error_el.inner_text()[:100]
-                            self.log(f"发现错误: {error_text}", "ERROR")
-                            return False
-                    except:
-                        pass
-            except:
-                pass
+        if 'verified-device' not in page.url:
             return True
         
-        # 所有验证方式都超时
-        self.log("所有验证方式均超时", "ERROR")
-        self.tg.send("❌ <b>所有验证方式均超时</b>")
-        return False
-    
-    def handle_2fa_code_input_for_device_verification(self, page, code):
-        """在设备验证过程中处理验证码输入"""
-        self.log("在设备验证过程中使用验证码验证", "INFO")
-        
-        # 尝试点击切换到验证码选项（如果存在）
-        try:
-            # 尝试查找切换到验证码的链接
-            switch_selectors = [
-                'a:has-text("Use an authentication app")',
-                'a:has-text("Enter a code")',
-                'button:has-text("Use an authentication app")',
-                'a[href*="two-factor/app"]',
-                'button:has-text("Authenticator app")'
-            ]
-            
-            for selector in switch_selectors:
-                try:
-                    element = page.locator(selector).first
-                    if element.is_visible(timeout=2000):
-                        element.click()
-                        self.log("已切换到验证码输入", "SUCCESS")
-                        time.sleep(2)
-                        page.wait_for_load_state('networkidle', timeout=15000)
-                        self.shot(page, "切换到验证码输入")
-                        break
-                except:
-                    pass
-        except Exception as e:
-            self.log(f"切换验证方式失败: {e}", "WARN")
-        
-        # 常见 OTP 输入框 selector（优先级排序）
-        selectors = [
-            'input[autocomplete="one-time-code"]',
-            'input[name="app_otp"]',
-            'input[name="otp"]',
-            'input#app_totp',
-            'input#otp',
-            'input[inputmode="numeric"]'
-        ]
-        
-        for sel in selectors:
-            try:
-                el = page.locator(sel).first
-                if el.is_visible(timeout=2000):
-                    el.fill(code)
-                    self.log(f"已填入验证码", "SUCCESS")
-                    time.sleep(1)
-                    
-                    # 优先点击 Verify 按钮，不行再 Enter
-                    submitted = False
-                    verify_btns = [
-                        'button:has-text("Verify")',
-                        'button[type="submit"]',
-                        'input[type="submit"]'
-                    ]
-                    for btn_sel in verify_btns:
-                        try:
-                            btn = page.locator(btn_sel).first
-                            if btn.is_visible(timeout=1000):
-                                btn.click()
-                                submitted = True
-                                self.log("已点击 Verify 按钮", "SUCCESS")
-                                break
-                        except:
-                            pass
-                    
-                    if not submitted:
-                        page.keyboard.press("Enter")
-                        self.log("已按 Enter 提交", "SUCCESS")
-                    
-                    time.sleep(3)
-                    page.wait_for_load_state('networkidle', timeout=30000)
-                    self.shot(page, "验证码提交后")
-                    
-                    # 检查是否有错误消息
-                    try:
-                        error_selectors = [
-                            '.flash-error',
-                            '.js-flash-alert',
-                            '[role="alert"]',
-                            '.error',
-                            'div:has-text("verification code")',
-                            'div:has-text("invalid")',
-                            'div:has-text("不正确")',
-                            'div:has-text("错误")'
-                        ]
-                        
-                        for error_sel in error_selectors:
-                            try:
-                                error_el = page.locator(error_sel).first
-                                if error_el.is_visible(timeout=2000):
-                                    error_text = error_el.inner_text()[:100]
-                                    self.log(f"验证码错误: {error_text}", "ERROR")
-                                    return False
-                            except:
-                                pass
-                    except:
-                        pass
-                    
-                    # 检查是否通过
-                    time.sleep(2)  # 等待页面反应
-                    url = page.url
-                    if 'verified-device' not in url and 'device-verification' not in url:
-                        # 再次确认确实离开了验证页面
-                        if 'two-factor' not in url and 'login' not in url:
-                            self.log("验证码验证通过！", "SUCCESS")
-                            self.tg.send("✅ <b>验证码验证通过</b>")
-                            return True
-                        else:
-                            self.log("可能还在验证流程中", "WARN")
-                            # 继续等待一小段时间确认
-                            for _ in range(5):
-                                time.sleep(1)
-                                current_url = page.url
-                                if 'verified-device' not in current_url and 'device-verification' not in current_url:
-                                    self.log("验证码验证通过！", "SUCCESS")
-                                    return True
-                            return False
-                    else:
-                        self.log("验证码可能错误，仍然在验证页面", "WARN")
-                        return self.continue_wait_device(page)
-            except:
-                pass
-        
-        self.log("没找到验证码输入框", "WARN")
-        # 如果找不到验证码输入框，继续等待其他验证方式
-        return self.continue_wait_device(page)
-    
-    def continue_wait_device(self, page):
-        """验证码验证失败后继续等待其他验证方式"""
-        remaining_time = 30  # 再给30秒时间
-        self.log(f"继续等待其他验证方式 {remaining_time} 秒", "INFO")
-        
-        for i in range(remaining_time):
-            time.sleep(1)
-            
-            # 检查是否已通过设备验证
-            url = page.url
-            if 'verified-device' not in url and 'device-verification' not in url:
-                # 检查是否有错误消息
-                try:
-                    error_selectors = [
-                        '.flash-error',
-                        '.js-flash-alert',
-                        '[role="alert"]',
-                        '.error'
-                    ]
-                    
-                    for error_sel in error_selectors:
-                        try:
-                            error_el = page.locator(error_sel).first
-                            if error_el.is_visible(timeout=1000):
-                                error_text = error_el.inner_text()[:100]
-                                self.log(f"发现错误: {error_text}", "ERROR")
-                                return False
-                        except:
-                            pass
-                except:
-                    pass
-                
-                self.log("设备验证通过！", "SUCCESS")
-                self.tg.send("✅ <b>设备验证通过</b>")
-                return True
-        
-        self.log("验证失败", "ERROR")
+        self.log("设备验证超时", "ERROR")
+        self.tg.send("❌ <b>设备验证超时</b>")
         return False
     
     def wait_two_factor_mobile(self, page):
@@ -756,56 +575,14 @@ class AutoLogin:
                     time.sleep(3)
                     page.wait_for_load_state('networkidle', timeout=30000)
                     self.shot(page, "验证码提交后")
-                    
-                    # 检查是否有错误消息（验证码错误）
-                    try:
-                        error_selectors = [
-                            '.flash-error',
-                            '.js-flash-alert',
-                            '[role="alert"]',
-                            '.error',
-                            'div:has-text("verification code")',
-                            'div:has-text("invalid")',
-                            'div:has-text("不正确")',
-                            'div:has-text("错误")'
-                        ]
-                        
-                        for error_sel in error_selectors:
-                            try:
-                                error_el = page.locator(error_sel).first
-                                if error_el.is_visible(timeout=2000):
-                                    error_text = error_el.inner_text()[:100]
-                                    self.log(f"验证码错误: {error_text}", "ERROR")
-                                    self.tg.send(f"❌ <b>验证码错误: {error_text}</b>")
-                                    return False
-                            except:
-                                pass
-                    except:
-                        pass
 
                     # 检查是否通过
-                    time.sleep(2)  # 等待页面反应
-                    current_url = page.url
-                    if "github.com/sessions/two-factor/" not in current_url:
-                        # 再次确认确实离开了验证页面
-                        if "two-factor" not in current_url and "login" not in current_url:
-                            self.log("验证码验证通过！", "SUCCESS")
-                            self.tg.send("✅ <b>验证码验证通过</b>")
-                            return True
-                        else:
-                            self.log("可能还在验证流程中", "WARN")
-                            # 可能还需要点击下一步或其他操作
-                            # 等待几秒再次检查
-                            for _ in range(5):
-                                time.sleep(1)
-                                current_url = page.url
-                                if "github.com/sessions/two-factor/" not in current_url and "two-factor" not in current_url:
-                                    self.log("验证码验证通过！", "SUCCESS")
-                                    return True
-                            self.log("仍然在验证页面，验证可能失败", "ERROR")
-                            return False
+                    if "github.com/sessions/two-factor/" not in page.url:
+                        self.log("验证码验证通过！", "SUCCESS")
+                        self.tg.send("✅ <b>验证码验证通过</b>")
+                        return True
                     else:
-                        self.log("验证码可能错误，仍然在验证页面", "ERROR")
+                        self.log("验证码可能错误", "ERROR")
                         self.tg.send("❌ <b>验证码可能错误，请检查后重试</b>")
                         return False
             except:
