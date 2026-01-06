@@ -576,15 +576,64 @@ class AutoLogin:
                     page.wait_for_load_state('networkidle', timeout=30000)
                     self.shot(page, "验证码提交后")
 
-                    # 检查是否通过
-                    if "github.com/sessions/two-factor/" not in page.url:
-                        self.log("验证码验证通过！", "SUCCESS")
-                        self.tg.send("✅ <b>验证码验证通过</b>")
-                        return True
-                    else:
-                        self.log("验证码可能错误", "ERROR")
-                        self.tg.send("❌ <b>验证码可能错误，请检查后重试</b>")
+                    # ========== 关键修复：增加更完善的验证逻辑 ==========
+                    # 等待页面变化，最多等待10秒
+                    start_time = time.time()
+                    while time.time() - start_time < 10:
+                        current_url = page.url
+                        
+                        # 如果离开了两步验证页面，检查是否成功
+                        if "github.com/sessions/two-factor/" not in current_url:
+                            # 检查是否有错误提示
+                            try:
+                                error_element = page.locator('.flash-error, .js-flash-alert, [role="alert"]').first
+                                if error_element.is_visible(timeout=1000):
+                                    error_text = error_element.inner_text()
+                                    if "incorrect" in error_text.lower() or "invalid" in error_text.lower() or "错误" in error_text.lower():
+                                        self.log("验证码错误", "ERROR")
+                                        self.tg.send("❌ <b>验证码错误</b>")
+                                        return False
+                            except:
+                                pass  # 没有找到错误提示元素
+                            
+                            # 检查是否跳转到成功页面（如授权页面或控制台）
+                            if "github.com/login/oauth/authorize" in current_url or "claw.cloud" in current_url:
+                                self.log("验证码验证通过！", "SUCCESS")
+                                self.tg.send("✅ <b>验证码验证通过</b>")
+                                return True
+                            else:
+                                # 可能是其他页面，检查是否有登录成功迹象
+                                try:
+                                    if page.locator('button[name="authorize"]').is_visible(timeout=2000):
+                                        self.log("验证码验证通过，等待授权", "SUCCESS")
+                                        return True
+                                except:
+                                    pass
+                        
+                        # 如果还在两步验证页面，检查是否有错误提示
+                        try:
+                            error_element = page.locator('.flash-error, .js-flash-alert, [role="alert"]').first
+                            if error_element.is_visible(timeout=1000):
+                                error_text = error_element.inner_text()
+                                if "incorrect" in error_text.lower() or "invalid" in error_text.lower():
+                                    self.log(f"验证码错误: {error_text}", "ERROR")
+                                    self.tg.send(f"❌ <b>验证码错误: {error_text[:100]}</b>")
+                                    return False
+                        except:
+                            pass  # 没有错误提示
+                        
+                        time.sleep(1)
+                    
+                    # 超时检查：如果还在两步验证页面，可能是验证码错误
+                    if "github.com/sessions/two-factor/" in page.url:
+                        self.log("验证失败，可能验证码错误", "ERROR")
+                        self.tg.send("❌ <b>验证失败，可能验证码错误</b>")
                         return False
+                    
+                    # 其他情况，默认成功
+                    self.log("验证码验证通过！", "SUCCESS")
+                    self.tg.send("✅ <b>验证码验证通过</b>")
+                    return True
             except:
                 pass
 
