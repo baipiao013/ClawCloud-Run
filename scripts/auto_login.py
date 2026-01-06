@@ -328,7 +328,7 @@ class AutoLogin:
         
         self.tg.send(f"""⚠️ <b>需要设备验证</b>
 
-请在 {DEVICE_VERIFY_WAIT} 秒内通过以下任一方式验证：
+用户{self.username}正在登录，请在 {DEVICE_VERIFY_WAIT} 秒内通过以下任一方式验证：
 1️⃣ 检查邮箱点击链接
 2️⃣ 在 GitHub App 批准
 3️⃣ 在 Telegram 发送 /code 验证码
